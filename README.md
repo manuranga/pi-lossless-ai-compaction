@@ -1,10 +1,15 @@
 # pi lossless AI compaction
 
-A [pi](https://github.com/earendil-works/pi) extension that adds `/loss-less-compact`. It compacts the whole conversation into one AI-written line per message and stores every message in full on disk, so nothing is lost: the agent reads the original whenever a summary line is not enough.
+A [pi](https://github.com/earendil-works/pi) extension that adds `/loss-less-compact`. It compacts the whole conversation into one AI-written line per message plus a short `<story>` of the conversation as a whole, and stores every message in full on disk, so nothing is lost: the agent reads the original whenever a summary line is not enough.
 
 ```
 0004-bash: Ran `bun test tests/auth.test.ts`: 3 pass, 2 fail. "login after reset" got null (auth.test.ts:58) ...
 0005-you: Root cause: resetPassword() bumps tokenVersion but leaves the stored session at version 1 ...
+
+<story>
+Goal: fix the bug where users are bounced to login after a password reset ...
+State: done and committed as a1b2c3d on main ...
+</story>
 
 Messages 0001-0011 are stored in full in ~/.full-conversations/<session>-<random>/, one file per line, named after the line prefix (e.g. 0001-user.txt). Read a file when you need its full content.
 ```
@@ -49,6 +54,7 @@ Each choice below was tested on the same session slice (95 summarized messages, 
 - **No cross-references between lines**: asking for refs to other messages ("fixes the failure in 0004-bash") either was ignored at scale or produced pointers mostly to the previous line. Refs did not shorten lines or add facts.
 - **"you" instead of "assistant"**, with the prompt framed as "a conversation between you and the user": the summary addresses the reader, who continues the work. First person in a summary ("I'll hold M5") means the reader, which is intended. Calling "you" "the agent" in the prompt instead cost ~20% of the facts on tool lines.
 - **"Later you will pick up the work from these summaries alone"**: written for a person resuming their own work. An AI-worded version ("these summaries will replace the conversation in your context") thinned the agent's own lines; with no purpose sentence, tool lines lost ~12% of their facts.
+- **`<story>` after the lines**: the same call ends with one story of the whole conversation (goal, constraints, done/in progress/blocked, decisions, next steps, critical context, after pi's default compaction prompt), limited to what the lines don't capture. Answering 8 questions from the summary alone, the story won 3 (current state with commit hashes, what happened to the rejected designs, open issues), made 1 more definite, and tied the rest. It adds ~20% to the summary (~4.5k chars on 96 summarized messages) and ~$0.02. It occasionally speculates beyond the messages.
 - **No kept tail**: everything is summarized. The agent recovers recent detail from the stored files when needed.
-- **Repeated compactions**: earlier blocks are kept byte for byte and numbering continues, so `0012-…` never collides with `0012-…` from an earlier block. The previous summary is passed to the summarizer as `<earlier>` context; on the test session this made no measurable difference, but it costs ~1% and helps vague follow-ups.
+- **Repeated compactions**: earlier blocks' lines and footers are kept byte for byte and numbering continues, so `0012-…` never collides with `0012-…` from an earlier block. Only the newest `<story>` is kept, since it covers the whole conversation and older ones would show a stale state. The previous summary is passed to the summarizer as `<earlier>` context; on the test session this made no measurable difference, but it costs ~1% and helps vague follow-ups.
 - **Images** are stored as `NNNN-label-N.<ext>` next to the message text, which names them as `[image: …]`. The summarizer does not see the images.

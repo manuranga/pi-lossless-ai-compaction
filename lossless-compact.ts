@@ -83,7 +83,7 @@ async function compact(ctx: ExtensionContext, signal: AbortSignal) {
 	}
 
 	const keys = items.filter(isSummarized).map(fileStem);
-	const { summaries, usage }: { summaries: Map<string, string>; usage?: Usage } =
+	const { summaries, story, usage }: { summaries: Map<string, string>; story?: string; usage?: Usage } =
 		keys.length > 0 ? await summarize(ctx, model, items, keys, previousSummary, signal) : { summaries: new Map(), usage: undefined };
 
 	const missing = keys.filter((key) => !summaries.has(key));
@@ -93,7 +93,9 @@ async function compact(ctx: ExtensionContext, signal: AbortSignal) {
 	});
 	const lastId = items[items.length - 1].id;
 	const footer = `Messages ${pad(firstId)}-${pad(lastId)} are stored in full in ${dir}/, one file per line, named after the line prefix (e.g. ${fileName(items[0])}). Read a file when you need its full content.`;
-	const summary = [previousSummary, `${lines.join("\n")}\n\n${footer}`].filter(Boolean).join("\n\n");
+	const storyBlock = story ? `\n\n<story>\n${story}\n</story>` : "";
+	const carried = story ? previousSummary?.replace(/\n\n<story>[\s\S]*?<\/story>/g, "") : previousSummary;
+	const summary = [carried, `${lines.join("\n")}${storyBlock}\n\n${footer}`].filter(Boolean).join("\n\n");
 	const details: Details = { firstId, lastId, clipped: missing.length };
 	return { summary, firstKeptEntryId: "", usage, details };
 }
@@ -114,7 +116,8 @@ async function summarize(
 	if (response.stopReason === "error" || response.stopReason === "aborted") throw new Error(response.errorMessage ?? response.stopReason);
 	const text = response.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 	const summaries = new Map([...text.matchAll(/<s ref="([^"]+)"[^>]*>([\s\S]*?)<\/s>/g)].map((match) => [match[1], match[2]]));
-	return { summaries, usage: response.usage };
+	const story = text.match(/<story>([\s\S]*?)<\/story>/)?.[1].trim();
+	return { summaries, story, usage: response.usage };
 }
 
 function toItems(messages: Parameters<typeof convertToLlm>[0], firstId: number): Item[] {
@@ -165,7 +168,9 @@ Rules:
 - User entries: every request, constraint and preference.
 - Terse plain English. Do not repeat the label. Do not invent facts.
 
-Output: write one element per ref, in order, exactly as <s ref="<ref>"><summary></s>. Write nothing else.
+After the last element, write a <story> element about the whole conversation, including <earlier> if present: the goal, the user's constraints and preferences, what is done, in progress or blocked, key decisions and why, next steps, and critical context. Include only what the lines above don't capture: what spans several messages, the current state and what comes next. Do not restate what a single line already says.
+
+Output: write one element per ref, in order, exactly as <s ref="<ref>"><summary></s>, then one <story>...</story> element. Write nothing else.
 
 ${input}`;
 }
