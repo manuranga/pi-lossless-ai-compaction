@@ -11,7 +11,7 @@ Goal: fix the bug where users are bounced to login after a password reset ...
 State: done and committed as a1b2c3d on main ...
 </story>
 
-Messages 0001-0011 are stored in full in ~/.full-conversations/<session>-<random>/, one file per line, named after the line prefix (e.g. 0001-user.txt). Read a file when you need its full content.
+Messages 0001-0011 are stored in full in ~/.full-conversations/<session>-<random>/, one file per line, named after the line prefix (e.g. 0001-user.txt). The lines above are condensed and leave out exact details. You must look up relevant information there before starting work.
 ```
 
 ## Install
@@ -21,6 +21,11 @@ cp lossless-compact.ts ~/.pi/agent/extensions/
 ```
 
 Then `/reload` in a running pi. `/compact` and automatic compaction are untouched; only `/loss-less-compact` uses this extension.
+
+## Usage
+
+- `/loss-less-compact` summarizes every message.
+- `/loss-less-compact N` keeps the last N message lines as they are, after the summary. A kept tool result also keeps the message that called the tool, so N=1 can keep a few more lines. The next compaction numbers and stores the kept messages.
 
 ## Requirements and limits
 
@@ -55,6 +60,7 @@ Each choice below was tested on the same session slice (95 summarized messages, 
 - **"you" instead of "assistant"**, with the prompt framed as "a conversation between you and the user": the summary addresses the reader, who continues the work. First person in a summary ("I'll hold M5") means the reader, which is intended. Calling "you" "the agent" in the prompt instead cost ~20% of the facts on tool lines.
 - **"Later you will pick up the work from these summaries alone"**: written for a person resuming their own work. An AI-worded version ("these summaries will replace the conversation in your context") thinned the agent's own lines; with no purpose sentence, tool lines lost ~12% of their facts.
 - **`<story>` after the lines**: the same call ends with one story of the whole conversation (goal, constraints, done/in progress/blocked, decisions, next steps, critical context, after pi's default compaction prompt), limited to what the lines don't capture. Answering 8 questions from the summary alone, the story won 3 (current state with commit hashes, what happened to the rejected designs, open issues), made 1 more definite, and tied the rest. It adds ~20% to the summary (~4.5k chars on 96 summarized messages) and ~$0.02. It occasionally speculates beyond the messages.
-- **No kept tail**: everything is summarized. The agent recovers recent detail from the stored files when needed.
+- **No kept tail by default**: everything is summarized and the agent recovers recent detail from the stored files. `/loss-less-compact N` keeps the last N messages for when the latest status matters; in one real session the user pasted the agent's final status back in after compaction had condensed it to one line.
+- **A directive footer**: "You must look up relevant information there before starting work." With the earlier footer ("Read a file when you need its full content"), an agent 180 messages after compaction guessed its own email sender address instead of looking it up. Replaying that session's compaction with Opus 5.5: asked for an exact earlier value, every footer led to a lookup (6/6 each). Told only "Continue the work.", the agent read the stored files before anything else in 3/3 runs with this footer, 1/3 with a variant listing what to look up (names, addresses, paths, …), and 0/3 with the earlier footer. Behaviour far from the compaction, where the miss happened, is still unmeasured.
 - **Repeated compactions**: earlier blocks' lines and footers are kept byte for byte and numbering continues, so `0012-…` never collides with `0012-…` from an earlier block. Only the newest `<story>` is kept, since it covers the whole conversation and older ones would show a stale state. The previous summary is passed to the summarizer as `<earlier>` context; on the test session this made no measurable difference, but it costs ~1% and helps vague follow-ups.
 - **Images** are stored as `NNNN-label-N.<ext>` next to the message text, which names them as `[image: …]`. The summarizer does not see the images.

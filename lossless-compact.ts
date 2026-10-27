@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Api, ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai";
-import { convertToLlm, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, type ExtensionAPI, type ExtensionContext, type ProjectedSessionEntry } from "@earendil-works/pi-coding-agent";
 
 const MODEL_PROVIDER = "anthropic";
 const MODEL_ID = "claude-sonnet-5-5";
@@ -25,24 +25,40 @@ interface Details {
 	firstId: number;
 	lastId: number;
 	clipped: number;
+	kept: number;
+}
+
+interface Part {
+	label: string;
+	message: Message;
+	wrap?: (text: string) => string;
+	/** Index of the projected entry that holds this message. */
+	entry: number;
+	/** Index of the projected entry to keep from so this message stays whole (a tool result needs its call). */
+	cut: number;
 }
 
 export default function (pi: ExtensionAPI) {
-	let requested = false;
+	let requested: number | undefined;
 
 	pi.registerCommand("loss-less-compact", {
-		description: "Compact everything into per-message AI summaries backed by full-text files",
-		handler: async (_args, ctx) => {
-			requested = true;
+		description: "Compact into per-message AI summaries backed by full-text files; optionally keep the last N messages as they are",
+		handler: async (args, ctx) => {
+			const keep = args.trim() === "" ? 0 : Number(args.trim());
+			if (!Number.isInteger(keep) || keep < 0) {
+				ctx.ui.notify("Usage: /loss-less-compact [number of last messages to keep]", "warning");
+				return;
+			}
+			requested = keep;
 			await new Promise<void>((resolve) =>
 				ctx.compact({
 					onComplete: (result) => {
-						const { firstId, lastId, clipped } = result.details as Details;
-						ctx.ui.notify(`Compacted ${pad(firstId)}-${pad(lastId)}, ${clipped} clipped`, clipped > 0 ? "warning" : "info");
+						const { firstId, lastId, clipped, kept } = result.details as Details;
+						ctx.ui.notify(`Compacted ${pad(firstId)}-${pad(lastId)}, ${clipped} clipped, ${kept} kept`, clipped > 0 ? "warning" : "info");
 						resolve();
 					},
 					onError: (error) => {
-						requested = false;
+						requested = undefined;
 						ctx.ui.notify(`Lossless compaction failed: ${error.message}`, "error");
 						resolve();
 					},
@@ -52,10 +68,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (!requested) return;
-		requested = false;
+		if (requested === undefined) return;
+		const keep = requested;
+		requested = undefined;
 		try {
-			return { compaction: { ...(await compact(ctx, event.signal)), tokensBefore: event.preparation.tokensBefore } };
+			return { compaction: { ...(await compact(ctx, keep, event.signal)), tokensBefore: event.preparation.tokensBefore } };
 		} catch (error) {
 			ctx.ui.notify(`Lossless compaction failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return { cancel: true };
@@ -63,7 +80,7 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-async function compact(ctx: ExtensionContext, signal: AbortSignal) {
+async function compact(ctx: ExtensionContext, keep: number, signal: AbortSignal) {
 	const model = ctx.modelRegistry.find(MODEL_PROVIDER, MODEL_ID);
 	if (!model) throw new Error(`model not found: ${MODEL_PROVIDER}/${MODEL_ID}`);
 
@@ -71,7 +88,13 @@ async function compact(ctx: ExtensionContext, signal: AbortSignal) {
 	const previous = projection.entries.find((entry) => entry.sourceEntry.type === "compaction")?.sourceEntry;
 	const previousSummary = previous?.type === "compaction" ? previous.summary : undefined;
 	const firstId = (previous?.type === "compaction" ? ((previous.details as Details | undefined)?.lastId ?? 0) : 0) + 1;
-	const items = toItems(projection.messages, firstId);
+	const parts = toParts(projection.entries);
+	const cut = keep > 0 ? parts[parts.length - keep]?.cut : undefined;
+	if (keep > parts.length) throw new Error(`cannot keep ${keep} of ${parts.length} messages`);
+	const items = toItems(
+		cut === undefined ? parts : parts.filter((part) => part.entry < cut),
+		firstId,
+	);
 	if (items.length === 0) throw new Error("nothing to compact");
 
 	const root = join(homedir(), ".full-conversations");
@@ -92,12 +115,13 @@ async function compact(ctx: ExtensionContext, signal: AbortSignal) {
 		return `${fileStem(item)}: ${oneLine(text)}`;
 	});
 	const lastId = items[items.length - 1].id;
-	const footer = `Messages ${pad(firstId)}-${pad(lastId)} are stored in full in ${dir}/, one file per line, named after the line prefix (e.g. ${fileName(items[0])}). Read a file when you need its full content.`;
+	const footer = `Messages ${pad(firstId)}-${pad(lastId)} are stored in full in ${dir}/, one file per line, named after the line prefix (e.g. ${fileName(items[0])}). The lines above are condensed and leave out exact details. You must look up relevant information there before starting work.`;
 	const storyBlock = story ? `\n\n<story>\n${story}\n</story>` : "";
 	const carried = story ? previousSummary?.replace(/\n\n<story>[\s\S]*?<\/story>/g, "") : previousSummary;
 	const summary = [carried, `${lines.join("\n")}${storyBlock}\n\n${footer}`].filter(Boolean).join("\n\n");
-	const details: Details = { firstId, lastId, clipped: missing.length };
-	return { summary, firstKeptEntryId: "", usage, details };
+	const details: Details = { firstId, lastId, clipped: missing.length, kept: parts.length - items.length };
+	const firstKeptEntryId = cut === undefined ? "" : projection.entries[cut].sourceEntry.id;
+	return { summary, firstKeptEntryId, usage, details };
 }
 
 async function summarize(
@@ -120,33 +144,39 @@ async function summarize(
 	return { summaries, story, usage: response.usage };
 }
 
-function toItems(messages: Parameters<typeof convertToLlm>[0], firstId: number): Item[] {
-	const calls = new Map<string, unknown>();
-	const items: Item[] = [];
-	const add = (label: string, message: Message, wrap: (text: string) => string = (text) => text) => {
-		const id = firstId + items.length;
+function toParts(entries: ProjectedSessionEntry[]): Part[] {
+	const calls = new Map<string, { args: unknown; entry: number }>();
+	const parts: Part[] = [];
+	entries.forEach(({ messages }, entry) => {
+		for (const message of convertToLlm(messages.filter((message) => message.role !== "compactionSummary"))) {
+			if (message.role === "user" && contentText(message, () => "[image]")) parts.push({ label: "user", message, entry, cut: entry });
+			if (message.role === "assistant") {
+				for (const block of message.content) if (block.type === "toolCall") calls.set(block.id, { args: block.arguments, entry });
+				if (contentText(message, () => "[image]")) parts.push({ label: "you", message, entry, cut: entry });
+			}
+			if (message.role === "toolResult") {
+				const call = calls.get(message.toolCallId);
+				const args = JSON.stringify(call?.args ?? {});
+				const error = message.isError ? "ERROR: " : "";
+				const wrap = (text: string) => `<args>${args}</args>\n<output>\n${error}${text}\n</output>`;
+				parts.push({ label: message.toolName, message, wrap, entry, cut: call?.entry ?? entry });
+			}
+		}
+	});
+	return parts;
+}
+
+function toItems(parts: Part[], firstId: number): Item[] {
+	return parts.map(({ label, message, wrap = (text) => text }, index) => {
+		const id = firstId + index;
 		const images: Item["images"] = [];
 		const text = contentText(message, (image) => {
 			const name = `${fileStem({ id, label })}-${images.length + 1}.${image.mimeType.split("/")[1] ?? "bin"}`;
 			images.push({ name, data: image.data });
 			return `[image: ${name}]`;
 		});
-		const content = wrap(text);
-		if (content) items.push({ id, label, content, images });
-	};
-	for (const message of convertToLlm(messages.filter((message) => message.role !== "compactionSummary"))) {
-		if (message.role === "user") add("user", message);
-		if (message.role === "assistant") {
-			for (const block of message.content) if (block.type === "toolCall") calls.set(block.id, block.arguments);
-			add("you", message);
-		}
-		if (message.role === "toolResult") {
-			const args = JSON.stringify(calls.get(message.toolCallId) ?? {});
-			const error = message.isError ? "ERROR: " : "";
-			add(message.toolName, message, (text) => `<args>${args}</args>\n<output>\n${error}${text}\n</output>`);
-		}
-	}
-	return items;
+		return { id, label, content: wrap(text), images };
+	});
 }
 
 function buildPrompt(items: Item[], keys: string[], previousSummary: string | undefined): string {
